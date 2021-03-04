@@ -1,16 +1,16 @@
 import asyncio
 from abc import ABCMeta, abstractmethod
 
+from reactivestreams.publisher import Publisher, DefaultPublisher
 from rsocket.connection import Connection
 from rsocket.frame import CancelFrame, ErrorFrame, KeepAliveFrame, \
     LeaseFrame, MetadataPushFrame, RequestChannelFrame, \
     RequestFireAndForgetFrame, RequestNFrame, RequestResponseFrame, \
     RequestStreamFrame, PayloadFrame, SetupFrame
 from rsocket.frame import ErrorCode
+from rsocket.handlers import RequestResponseRequester, \
+    RequestResponseResponder, RequestStreamRequester, RequestStreamResponder, RequestFireAndForgetResponder
 from rsocket.payload import Payload
-from reactivestreams.publisher import Publisher, DefaultPublisher
-from rsocket.handlers import RequestResponseRequester,\
-    RequestResponseResponder, RequestStreamRequester, RequestStreamResponder
 
 MAX_STREAM_ID = 0x7FFFFFFF
 
@@ -19,6 +19,7 @@ class RequestHandler(metaclass=ABCMeta):
     """
     An ABC for request handlers.
     """
+
     def __init__(self, socket):
         super().__init__()
         self.socket = socket
@@ -149,7 +150,9 @@ class RSocket:
                     elif isinstance(frame, RequestChannelFrame):
                         pass
                     elif isinstance(frame, RequestFireAndForgetFrame):
-                        pass
+                        RequestFireAndForgetResponder(
+                            self._handler.request_fire_and_forget, Payload(
+                                frame.data, frame.metadata))
                     elif isinstance(frame, RequestResponseFrame):
                         stream = frame.stream_id
                         self._streams[stream] = RequestResponseResponder(
@@ -182,6 +185,13 @@ class RSocket:
                     await self._writer.drain()
         except asyncio.CancelledError:
             pass
+
+    def fire_and_forget(self, payload):
+        frame = RequestFireAndForgetFrame()
+        frame.stream_id = self.allocate_stream()
+        frame.metadata = payload.metadata
+        frame.data = payload.data
+        self.send_frame(frame)
 
     def request_response(self, payload):
         stream = self.allocate_stream()

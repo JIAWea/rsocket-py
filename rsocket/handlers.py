@@ -36,6 +36,12 @@ class StreamHandler(metaclass=ABCMeta):
         self.socket.send_frame(frame)
 
 
+class RequestFireAndForgetResponder(metaclass=ABCMeta):
+    def __init__(self, handler, payload: Payload):
+        self.handler = handler
+        self.handler(payload)
+
+
 class RequestResponseRequester(StreamHandler, Future):
     def __init__(self, stream: int, socket, payload: Payload):
         super().__init__(stream, socket)
