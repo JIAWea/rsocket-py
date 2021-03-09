@@ -2,6 +2,10 @@ import asyncio
 import functools
 
 import pytest
+import rxbp
+from rxbp.acknowledgement.continueack import continue_ack
+from rxbp.observer import Observer
+from rxbp.schedulers.threadpoolscheduler import ThreadPoolScheduler
 
 from rsocket import BaseRequestHandler
 from rsocket.payload import Payload
@@ -190,3 +194,65 @@ async def test_reader(event_loop: asyncio.AbstractEventLoop):
     stream.feed_eof()
     data = await stream.read()
     assert data == b'data'
+
+
+@pytest.mark.asyncio
+async def test_request_stream_rxbp(pipe):
+    resulet = []
+
+    class Handler(BaseRequestHandler, Subscription):
+        def cancel(self):
+            self.subscription.dispose()
+
+        def request(self, n):
+            self.observer.incr_request_n(n)
+
+        def subscribe(self, observer: Observer = None,):
+            observer.request_n = 3
+            # noinspection PyAttributeOutsideInit
+            self.observer = observer
+
+            # noinspection PyAttributeOutsideInit
+            self.subscription = rxbp.from_range(8, batch_size=1).pipe(
+                rxbp.op.map(lambda v: Payload(b'data-' + str(v).encode('utf-8'), b'm')),
+            ).subscribe(observer=observer)
+            handler_subscribed.set()
+
+        def request_stream(self, payload: Payload):
+            return self
+
+    class StreamSubscriber(Subscriber):
+        def on_next(self, value_list):
+            for v in value_list:
+                data = v.data.decode('utf-8')
+                resulet.append(data)
+
+        def on_completed(self):
+            print('Complete')
+
+        def on_error(self, exception):
+            pass
+
+        def on_subscribe(self, subscription):
+            # noinspection PyAttributeOutsideInit
+            self.subscription = subscription
+
+    server, client = pipe
+    server._handler = handler = Handler(server)
+    stream_subscriber = StreamSubscriber()
+    publisher = client.request_stream(Payload(b''))
+
+    handler_subscribed = asyncio.Event()
+    publisher.subscribe(stream_subscriber)
+    await handler_subscribed.wait()
+
+    await asyncio.sleep(0.1)
+
+    assert resulet == ['data-0', 'data-1', 'data-2']
+
+    handler.request(2)
+    handler.cancel()
+
+    await asyncio.sleep(0.1)
+    assert resulet == ['data-0', 'data-1', 'data-2', 'data-3', 'data-4']
+    await asyncio.sleep(0.1)
