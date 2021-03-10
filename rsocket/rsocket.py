@@ -1,11 +1,14 @@
 import asyncio
+import logging
 from abc import ABCMeta, abstractmethod
 
 from rxbp.flowable import Flowable
 
-from reactivestreams.publisher import Publisher, DefaultPublisher
+from reactivestreams.publisher import Publisher
 from reactivestreams.rx.flowable import default_flowable
 from rsocket.connection import Connection
+from rsocket.errors import RuntimeExceptions, InvalidSetupException, UnsupportedSetupException, RejectedSetupException, \
+    ConnectionErrorException, verify_first_frame
 from rsocket.frame import CancelFrame, ErrorFrame, KeepAliveFrame, \
     LeaseFrame, MetadataPushFrame, RequestChannelFrame, \
     RequestFireAndForgetFrame, RequestNFrame, RequestResponseFrame, \
@@ -13,11 +16,13 @@ from rsocket.frame import CancelFrame, ErrorFrame, KeepAliveFrame, \
 from rsocket.frame import ErrorCode
 from rsocket.handlers import RequestResponseRequester, \
     RequestResponseResponder, RequestStreamRequester, RequestStreamResponder, RequestFireAndForgetResponder, \
-    RequestChannelResponder, RequestChannelRequester
+    RequestChannelResponder, RequestChannelRequester, SetupResponder
 from rsocket.payload import Payload
 from rsocket.subscriberrequestchannel import SinkSubscriber
 
 MAX_STREAM_ID = 0x7FFFFFFF
+
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 
 class RequestHandler(metaclass=ABCMeta):
@@ -28,6 +33,10 @@ class RequestHandler(metaclass=ABCMeta):
     def __init__(self, socket):
         super().__init__()
         self.socket = socket
+
+    @abstractmethod
+    def setup_handler(self, frame: SetupFrame):
+        pass
 
     @abstractmethod
     def request_channel(self, publisher: Publisher) \
@@ -52,6 +61,9 @@ class RequestHandler(metaclass=ABCMeta):
 
 
 class BaseRequestHandler(RequestHandler):
+    def setup_handler(self, frame: SetupFrame):
+        pass
+
     def request_channel(self, publisher: Publisher) -> Flowable:
         # self.socket.send_error(RuntimeError("Not implemented"))
         return default_flowable()
@@ -71,7 +83,9 @@ class BaseRequestHandler(RequestHandler):
 
 class RSocket:
     def __init__(self, reader, writer, *,
-                 handler_factory=BaseRequestHandler, loop=None, server=True):
+                 handler_factory=BaseRequestHandler, loop=None, server=True,
+                 data_encoding=b'utf-8', metadata_encoding=b'utf-8',
+                 setup_payload=None):
         self._reader = reader
         self._writer = writer
         self._server = server
@@ -91,9 +105,13 @@ class RSocket:
 
             setup.keep_alive_milliseconds = 60000
             setup.max_lifetime_milliseconds = 240000
+            # setup frame: data encoding, metadata encoding, setup payload
+            setup.data_encoding = data_encoding
+            setup.metadata_encoding = metadata_encoding
+            if setup_payload:
+                setup.data = setup_payload.data
+                setup.metadata = setup_payload.metadata
 
-            setup.data_encoding = b'utf-8'
-            setup.metadata_encoding = b'utf-8'
             self.send_frame(setup)
 
         self._receiver_task = loop.create_task(self._receiver())
@@ -113,6 +131,20 @@ class RSocket:
     def send_frame(self, frame):
         self._send_queue.put_nowait(frame)
 
+    def send_frame_directly(self, frame):
+        self._writer.write(frame.serialize())
+
+    def send_connection_error(self, code, exception):
+        error = ErrorFrame()
+        error.stream_id = 0
+        error.error_code = code
+        error.data = str(exception).encode()
+        self.send_frame_directly(error)
+
+    def send_setup_error(self, e: InvalidSetupException):
+        code, msg = e.args
+        self.send_connection_error(code, msg)
+
     async def send_error(self, stream, exception):
         error = ErrorFrame()
         error.stream_id = stream
@@ -131,6 +163,7 @@ class RSocket:
 
     async def _receiver(self):
         try:
+            first_frame = True
             connection = Connection()
             while True:
                 data = await self._reader.read(1024)
@@ -139,6 +172,16 @@ class RSocket:
                     break
                 frames = connection.receive_data(data)
                 for frame in frames:
+                    if self._server:
+                        if first_frame:
+                            try:
+                                verify_first_frame(frame)
+                            except InvalidSetupException as e:
+                                self.send_setup_error(e)
+                                return
+                            else:
+                                first_frame = False
+
                     stream = frame.stream_id
                     if stream and stream in self._streams:
                         self._streams[stream].frame_received(frame)
@@ -146,7 +189,18 @@ class RSocket:
                     if isinstance(frame, CancelFrame):
                         pass
                     elif isinstance(frame, ErrorFrame):
-                        pass
+                        try:
+                            # TODO: 打印错误信息？
+                            raise RuntimeExceptions().handle(
+                                frame.stream_id,
+                                frame.error_code,
+                                frame.data.decode('utf-8'))
+                        except (InvalidSetupException, RejectedSetupException,
+                                UnsupportedSetupException, ConnectionErrorException) as e:
+                            logging.error(str(e.args[1]))
+                            return
+                        except Exception as e:
+                            logging.error(str(e.args[1]))
                     elif isinstance(frame, KeepAliveFrame):
                         frame.flags_respond = False
                         self.send_frame(frame)
@@ -181,13 +235,25 @@ class RSocket:
                     elif isinstance(frame, PayloadFrame):
                         pass
                     elif isinstance(frame, SetupFrame):
-                        if frame.flags_lease:
-                            lease = LeaseFrame()
-                            lease.time_to_live = 10000
-                            lease.number_of_requests = 100
-                            self.send_frame(lease)
+                        if not self._server:
+                            data = frame.data.decode('utf-8')
+                            logging.warning("Requester received unsupported frame on stream 0: " + data)
+                            break
+
+                        try:
+                            SetupResponder(self, self._handler.setup_handler, frame).do_setup()
+                        except InvalidSetupException as e:
+                            self.send_setup_error(e)
+                            return
+                        except Exception as e:
+                            self.send_setup_error(InvalidSetupException(ErrorCode.INVALID_SETUP, str(e)))
+                            return
+
         except asyncio.CancelledError:
             pass
+        # finally:
+        #     # TODO: close?
+        #     self._writer.close()
 
     async def _sender(self):
         try:

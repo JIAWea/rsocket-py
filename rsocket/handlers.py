@@ -8,7 +8,7 @@ from reactivestreams import Publisher, Subscription, Subscriber
 from reactivestreams.subscriber import DefaultSubscriber
 from rsocket.acksubscriber import MAX_REQUEST_N
 from rsocket.frame import CancelFrame, ErrorFrame, RequestNFrame, \
-    RequestResponseFrame, RequestStreamFrame, PayloadFrame
+    RequestResponseFrame, RequestStreamFrame, PayloadFrame, SetupFrame
 from rsocket.payload import Payload
 from rsocket.subscriberrequestchannel import SinkSubscriber, RequestChannelRespondSubscriber, \
     RequestChannelRequestSubscriber
@@ -293,3 +293,24 @@ class RequestChannelResponder(StreamHandler, Subscription):
     def _dispose(self):
         self.sink.dispose()
         self.subscription.dispose()
+
+
+class SetupResponder:
+    def __init__(self, socket, setup_handler, frame: SetupFrame):
+        self.socket = socket
+        self.setup = frame
+        self.setup_handler = setup_handler
+
+    def do_setup(self):
+        # if frame.flags_lease:
+        #     lease = LeaseFrame()
+        #     lease.time_to_live = 10000
+        #     lease.number_of_requests = 100
+        #     self.socket.send_frame(lease)
+
+        if not self.setup.flags_resume:
+            # no resume
+            self.setup_handler(self.setup)
+        else:
+            # resume
+            pass
